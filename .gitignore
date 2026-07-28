@@ -1,0 +1,45 @@
+# HAR captures — contain live session tokens. NEVER commit.
+*.har
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Build artifacts
+build/
+dist/
+
+# Virtualenv (managed by uv, machine-specific)
+.venv/
+
+# Test caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Local CLI storage lives in ~/.my-car-cli/ (outside the repo),
+# but guard against accidental in-repo copies.
+.my-car-cli/
+
+# Credentials and local environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS cruft
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
