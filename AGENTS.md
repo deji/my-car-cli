@@ -15,8 +15,8 @@
 | CLI framework | **typer** | Type-hinted commands, no argparse |
 | Terminal UI | **rich** | Panels, tables, progress bars, colors |
 | HTTP | **httpx** | Synchronous client (not async) |
-| Secrets | **keyring** | Stores to Windows Credential Manager under `my-car-cli` / `bearer_token` |
-| Browser auto | **playwright** | Optional, installed via `login` extra. Chrome default, user-agent spoofed as Firefox 153 |
+| Secrets | Token file | `~/.my-car-cli/token`. `MY_CAR_AUTH_TOKEN` overrides it. |
+| Browser auto | **playwright** | Optional, installed via `login` extra. Chrome default; do not spoof a Firefox user agent |
 | Testing | **unittest** + **pytest** | Both work. Pytest is dev dep |
 | Build | **hatchling** | Config in `pyproject.toml` |
 | Linting | None configured | No ruff/flake8/mypy yet |
@@ -29,13 +29,14 @@
 src/my_car_cli/
 ├── __init__.py          # version = "0.1.0"
 ├── main.py              # CLI entry: "login", "status", "logout", "config"
-├── auth.py              # Token storage (keyring) + Playwright login flow
-├── api.py               # HTTP calls to OneWeb API (status + next-service)
+├── auth.py              # Token file + Playwright login flow
+├── api.py               # HTTP calls to OneWeb API (status, next-service, JWE refresh)
 ├── config.py            # ~/.my-car-cli/config.json (VIN, unit, TTL)
 ├── cache.py             # ~/.my-car-cli/cache.json (15min TTL)
 └── display.py           # Rich dashboard rendering
 tests/
-└── test_cli.py          # 4 tests: config, timestamp, dashboard, unit conversions
+├── test_cli.py          # Config, dashboard, token file, status refresh wiring
+└── test_api.py          # Mocked refresh and callback-UUID exchange
 BUGS.md                  # Bug log — add entries here after every fix
 .har files               # HAR captures from real Firefox login sessions (DO NOT COMMIT)
 ```
@@ -76,19 +77,20 @@ STEP  WHAT                                                   RESULT
 
   Phase 3 — User logs in manually in the browser window
 
-  Phase 4 — Token capture (two mechanisms)
+  Phase 4 — Token capture (three mechanisms)
     a) Request interceptor: catches Authorization: Bearer <jwe> on api.oneweb.* calls
     b) Response watcher: parses token= from redirect Location headers and page URLs
+    c) Callback UUID: if the page URL has ?token=<uuid>, exchange it once via GET /cias/v1/jwe/{uuid}
 ```
 
 ### Key facts about the token
 
 - Format: **JWE** (JSON Web Encryption), not standard JWT — it is opaque
-- Looks like: `eyJlbmMiOiJBMjU2Q0JDLUhTNTEy...` (~3500 chars of Base64)
+- Looks like: `eyJlbmMiOiJBMjU2Q0JDLUhTNTEy...` (about 4800 characters; too large for Windows Credential Manager)
 - Issued by: CIAS (CIAM Authentication Service)
 - Used as: `Authorization: Bearer {jwe_token}` on all `api.oneweb.mercedes-benz.com` requests
-- Expiry check: call the API and see if you get 401 (current). A proactive `bias-oidc/v1/validation` endpoint also exists — see BUGS.md #14 (not yet wired).
-- Token refresh: **exists** — `POST bias-oidc/v1/jwe/refresh` rotates the JWE using the old JWE as the credential. See BUGS.md #14. Not yet implemented; currently re-login required on expiry.
+- Expiry check: call the API and see if you get 401 (current). A proactive `GET /cias/v1/validation` endpoint also exists — see BUGS.md #14 and #18 (not yet wired).
+- Token refresh: on status 401, `POST /cias/v1/jwe/refresh` runs once and the status call is retried once. See BUGS.md #18. Full re-login remains the fallback when refresh fails.
 
 ---
 
@@ -129,8 +131,9 @@ uv run my-car status                   # show dashboard
 uv run my-car status --refresh         # bypass cache
 uv run my-car config --show            # view config
 uv run my-car config --vin <VIN>       # set VIN
-uv run my-car config --unit PSI        # set tyre unit
-uv run my-car logout                   # delete token + clear cache
+uv run my-car config --unit PSI        # set tyre unit (PSI or KPA)
+uv run my-car config --ttl 15          # set cache TTL in minutes
+uv run my-car logout                   # delete token file + clear cache
 
 # Testing
 uv run pytest tests/ -v
@@ -152,10 +155,10 @@ uv run python -c "import py_compile; py_compile.compile('src/my_car_cli/auth.py'
 | `api.oneweb.mercedes-benz.com/domains/vehicles/maintenances/next-service` | GET | Next service info |
 | `id.mercedes-benz.com/as/<tenant>/resume/as/authorization.ping` | POST | CIAM auth resume (JWT in body) |
 | `id.mercedes-benz.com/ciam/auth/login` | GET | CIAM login form (landing after redirect) |
-| `api.oneweb.mercedes-benz.com/bias-oidc/v1/validation` | GET | Check if current JWE is still valid (discovered — see BUGS.md #14) |
-| `api.oneweb.mercedes-benz.com/bias-oidc/v1/jwe/refresh` | POST | Rotate to a fresh JWE (discovered — see BUGS.md #14) |
-| `api.oneweb.mercedes-benz.com/bias-oidc/v1/claims?scope=FULL_NO_CIAM_ID` | PUT | Fetch user claims |
-| `api.oneweb.mercedes-benz.com/bias-oidc/v1/jwe/{intermediate_token}` | GET | Post-login exchange: CIAS callback UUID → real JWE |
+| `api.oneweb.mercedes-benz.com/cias/v1/validation` | GET | Check if current JWE is still valid (see BUGS.md #18) |
+| `api.oneweb.mercedes-benz.com/cias/v1/jwe/refresh` | POST | Rotate to a fresh JWE |
+| `api.oneweb.mercedes-benz.com/cias/v1/claims?scope=FULL_NO_CIAM_ID` | PUT | Fetch user claims |
+| `api.oneweb.mercedes-benz.com/cias/v1/jwe/{intermediate_token}` | GET | Post-login exchange: CIAS callback UUID → real JWE (raw text body) |
 
 ### API Headers (status-information)
 
@@ -163,7 +166,7 @@ uv run python -c "import py_compile; py_compile.compile('src/my_car_cli/auth.py'
 Authorization: Bearer {jwe_token}
 X-Application-Name: mmv-vehicle-stage
 X-me-FinOrVin: {vin}
-User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36
 Origin: https://www.mercedes-benz.co.uk
 Referer: https://www.mercedes-benz.co.uk/
 ```
@@ -193,11 +196,11 @@ Accept: application/json;version=2
 
 5. **JWE tokens are opaque** — the token looks like a JWT but is encrypted. You cannot decode it to check expiry. Handle 401s gracefully via `api.py:TokenExpiredException`.
 
-6. **Token refresh exists but not yet wired** — `POST bias-oidc/v1/jwe/refresh` rotates the JWE using the old JWE as the credential (discovered from the web app's `cias-login.mjs`; see BUGS.md #14 for the full protocol and implementation plan). Currently still re-login-on-401; implementation pending.
+6. **Token refresh uses `POST /cias/v1/jwe/refresh`** — not `bias-oidc`. See BUGS.md #18. On status 401 the CLI refreshes once, saves, and retries once. A 401 from refresh still means re-login.
 
 7. **Next-service API is non-critical** — if it fails, we silently return `{}` and show no service data. The status API failure is fatal.
 
-8. **Keyring is silent on failure** — both `get` and `delete` swallow exceptions. If the Windows Credential Manager is misconfigured, the user gets no error feedback.
+8. **The session token lives only in `~/.my-car-cli/token`** — Windows Credential Manager cannot store a JWE this large (`CredWrite` 1783). See BUGS.md #19. `MY_CAR_AUTH_TOKEN` still overrides the file when it is a JWE.
 
 9. **Dual `sys.stdout.reconfigure`** — happens in both `main.py` and `display.py`. Redundant but harmless.
 
@@ -205,7 +208,7 @@ Accept: application/json;version=2
 
 11. **HAR files in root** — 2 files (~14MB each) with sensitive session tokens. Must not be committed.
 
-12. **`set_stored_token` is imported but unused** in `main.py`. It's available for potential use but only `get`/`delete`/login functions are called.
+12. **`set_stored_token` saves the rotated JWE** on the status 401 path before the single retry.
 
 ---
 
@@ -215,15 +218,11 @@ Accept: application/json;version=2
 ~/.my-car-cli/
 ├── config.json           # {"vin": "...", "locale": "en-GB", "pressure_unit": "PSI", "cache_ttl_minutes": 15}
 ├── cache.json            # {"cached_at": <timestamp>, "vin": "...", "data": {...}}
+├── token                 # JWE bearer. The only token store.
 └── browser-profile/      # Playwright persistent context (Chrome profile, cookies, localStorage)
 
-Windows Credential Manager:
-  Service: my-car-cli
-  Account: bearer_token
-  Value:   <jwe_token>
-
 Environment:
-  MY_CAR_AUTH_TOKEN       # Overrides keyring if set
+  MY_CAR_AUTH_TOKEN       # Overrides the token file if set to a JWE
 ```
 
 ---

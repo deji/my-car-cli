@@ -13,6 +13,38 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "cache_ttl_minutes": 15,
 }
 
+VALID_PRESSURE_UNITS = ("PSI", "KPA")
+
+
+def validate_pressure_unit(unit: str) -> str:
+    """Validate tyre pressure unit (must be PSI or KPA, case-insensitive). Returns uppercased unit."""
+    if not isinstance(unit, str) or unit.upper() not in VALID_PRESSURE_UNITS:
+        raise ValueError(f"Invalid tyre pressure unit '{unit}'. Must be PSI or KPA.")
+    return unit.upper()
+
+
+def validate_ttl(ttl: int) -> int:
+    """Validate cache TTL minutes (must be >= 1)."""
+    if not isinstance(ttl, int) or ttl < 1:
+        raise ValueError(f"Cache TTL must be at least 1 minute (got {ttl}).")
+    return ttl
+
+
+def set_config_dir(path: Path) -> None:
+    """Set custom config directory (e.g. for testing)."""
+    global CONFIG_DIR, CONFIG_FILE, CACHE_FILE
+    CONFIG_DIR = Path(path)
+    CONFIG_FILE = CONFIG_DIR / "config.json"
+    CACHE_FILE = CONFIG_DIR / "cache.json"
+
+
+def reset_config_dir() -> None:
+    """Reset config directory to default ~/.my-car-cli."""
+    global CONFIG_DIR, CONFIG_FILE, CACHE_FILE
+    CONFIG_DIR = Path.home() / ".my-car-cli"
+    CONFIG_FILE = CONFIG_DIR / "config.json"
+    CACHE_FILE = CONFIG_DIR / "cache.json"
+
 
 def ensure_config_dir() -> Path:
     """Ensure that the configuration directory exists."""

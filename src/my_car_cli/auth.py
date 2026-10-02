@@ -1,13 +1,14 @@
 import os
+import re
 import sys
 import time
-import keyring
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 from rich.console import Console
 
-SERVICE_NAME = "my-car-cli"
-KEYRING_USER = "bearer_token"
+from my_car_cli.api import CarAPIError, TokenExpiredException, exchange_intermediate_token
+
 CONFIG_DIR = Path.home() / ".my-car-cli"
 BROWSER_PROFILE_DIR = CONFIG_DIR / "browser-profile"
 TOKEN_FILE = CONFIG_DIR / "token"
@@ -39,7 +40,6 @@ def _extract_token_from_url(url: str) -> Optional[str]:
     """Pull a JWE token from a ?token= query param on a mercedes-benz.co.uk URL."""
     if not url or "token=" not in url or "mercedes-benz.co.uk" not in url:
         return None
-    from urllib.parse import urlparse, parse_qs
 
     params = parse_qs(urlparse(url).query)
     token_val = params.get("token", [None])[0]
@@ -48,27 +48,64 @@ def _extract_token_from_url(url: str) -> Optional[str]:
     return None
 
 
+_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def extract_intermediate_uuid(url: str) -> str | None:
+    """Return a canonical UUID only when the URL contains mercedes-benz.co.uk and a matching token param."""
+    if not url or "token=" not in url or "mercedes-benz.co.uk" not in url:
+        return None
+
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "mercedes-benz.co.uk" and not hostname.endswith(".mercedes-benz.co.uk"):
+        return None
+
+    params = parse_qs(parsed.query)
+    token_vals = params.get("token")
+    if not token_vals or not token_vals[0]:
+        return None
+
+    token_val = token_vals[0]
+    if _UUID_PATTERN.match(token_val):
+        return token_val.lower()
+
+    return None
+
+
+def _try_exchange_callback_uuid(url: str, attempted: set[str]) -> Optional[str]:
+    """
+    Exchange a CIAS callback UUID found on `url` for a real JWE, at most once.
+
+    The post-login redirect can carry ?token=<uuid> (an intermediate token,
+    not the bearer JWE). If the page's JS never fires an Authorization header,
+    this exchange is the only way to get the JWE. Each UUID is attempted a
+    single time per login session; failures print a one-line note and the wait
+    loop keeps waiting for the header-captured JWE.
+    """
+    uuid = extract_intermediate_uuid(url)
+    if not uuid or uuid in attempted:
+        return None
+    attempted.add(uuid)
+    try:
+        jwe = exchange_intermediate_token(uuid)
+    except (TokenExpiredException, CarAPIError) as e:
+        console.print(f"[dim]Intermediate token exchange failed ({e}); continuing to wait.[/dim]")
+        return None
+    except Exception as e:
+        console.print(f"[dim]Intermediate token exchange error ({e}); continuing to wait.[/dim]")
+        return None
+    return jwe if _looks_like_jwe(jwe) else None
+
+
 def get_stored_token() -> Optional[str]:
     env_token = os.getenv("MY_CAR_AUTH_TOKEN")
     if env_token:
         cleaned = env_token.strip().removeprefix("Bearer ").strip()
         if _looks_like_jwe(cleaned):
             return cleaned
-
-    try:
-        token = keyring.get_password(SERVICE_NAME, KEYRING_USER)
-        if token:
-            cleaned = token.strip().removeprefix("Bearer ").strip()
-            if _looks_like_jwe(cleaned):
-                return cleaned
-            # Stale/non-JWE value in keyring (e.g. a UUID from a pre-validation
-            # login). Delete it so it doesn't shadow the token file every call.
-            try:
-                keyring.delete_password(SERVICE_NAME, KEYRING_USER)
-            except Exception:
-                pass
-    except Exception:
-        pass
 
     if TOKEN_FILE.exists():
         try:
@@ -86,20 +123,15 @@ def set_stored_token(token: str) -> bool:
         console.print("[bold red]Token does not look like a valid JWE (must start with 'eyJ' and be >100 chars). Not saving.[/bold red]")
         return False
     try:
-        keyring.set_password(SERVICE_NAME, KEYRING_USER, clean_token)
-    except Exception as e:
-        console.print(f"[dim yellow]Keyring unavailable ({e}), falling back to file storage.[/dim yellow]")
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         TOKEN_FILE.write_text(clean_token, encoding="utf-8")
-        console.print(f"[dim yellow]Token saved to {TOKEN_FILE}[/dim yellow]")
+    except Exception as e:
+        console.print(f"[bold red]Could not save token to {TOKEN_FILE}: {e}[/bold red]")
+        return False
     return True
 
 
 def delete_stored_token() -> None:
-    try:
-        keyring.delete_password(SERVICE_NAME, KEYRING_USER)
-    except Exception:
-        pass
     try:
         if TOKEN_FILE.exists():
             TOKEN_FILE.unlink()
@@ -119,7 +151,7 @@ def login_manual_paste() -> str:
     console.print("\n[bold cyan]My Car CLI Manual Authentication[/bold cyan]")
     console.print("[dim]------------------------------------------------------------[/dim]")
     console.print("Follow these steps to obtain your authentication token:")
-    console.print("1. Open [bold yellow]https://id.mercedes-benz.com/ciam/auth/login[/bold yellow] in your browser and log in.")
+    console.print("1. Open [bold yellow]https://www.mercedes-benz.co.uk/[/bold yellow] in your browser and sign in from that site.")
     console.print("2. Open Browser Developer Tools ([bold white]F12[/bold white] or [bold white]Ctrl+Shift+I[/bold white]).")
     console.print("3. Go to the [bold white]Network[/bold white] tab and filter by [bold white]api.oneweb[/bold white].")
     console.print("4. Click on any request (e.g. status-information) and look under [bold white]Request Headers[/bold white].")
@@ -138,7 +170,7 @@ def login_manual_paste() -> str:
             continue
 
         set_stored_token(clean_token)
-        console.print("[bold green]Token saved successfully to OS Credential Manager![/bold green]\n")
+        console.print(f"[bold green]Token saved to {TOKEN_FILE}[/bold green]\n")
         return clean_token
 
 
@@ -240,13 +272,28 @@ def login_interactive_playwright() -> str:
 
         timeout_at = time.time() + LOGIN_TIMEOUT_SECONDS
         nav_error = False
+        attempted_callback_uuids: set[str] = set()
         while not captured_token:
             page.wait_for_timeout(1000)
+            if captured_token:
+                break
             if page.is_closed():
                 break
             if time.time() > timeout_at:
                 console.print("[bold yellow]Login timed out after 5 minutes.[/bold yellow]")
                 break
+            # The CIAS callback redirect may carry ?token=<uuid> (intermediate
+            # token) when the post-login page's JS never fires the Bearer
+            # request. Exchange each unseen callback UUID once for the real JWE.
+            try:
+                page_url = page.url
+            except Exception:
+                page_url = ""
+            if page_url:
+                exchanged = _try_exchange_callback_uuid(page_url, attempted_callback_uuids)
+                if exchanged:
+                    captured_token = exchanged
+                    break
             # Detect a Chromium navigation error page (e.g. ERR_HTTP2_PROTOCOL_ERROR,
             # ERR_QUIC_PROTOCOL_ERROR) so we don't hang silently for the full timeout.
             try:

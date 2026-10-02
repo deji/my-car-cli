@@ -8,7 +8,7 @@ A fast command-line dashboard for MB EQB stats.
 - Odometer reading
 - Tyre pressures in KPA or PSI
 - Next-service distance
-- OS Credential Manager token storage
+- Local token file under `~/.my-car-cli/`
 - Configurable local response caching
 - Optional browser-assisted login
 
@@ -66,9 +66,9 @@ uv run my-car --version
 
 ## Local Data
 
-Configuration, cache, browser data, and any fallback token file are stored under `~/.my-car-cli/`. Authentication tokens are stored in the OS Credential Manager when available.
+Configuration, cache, browser data, and the authentication token are stored under `~/.my-car-cli/`. The token file is `~/.my-car-cli/token`.
 
-Set `MY_CAR_AUTH_TOKEN` to provide a bearer token without using stored credentials.
+Set `MY_CAR_AUTH_TOKEN` to provide a bearer token without using the token file.
 
 ## Tests
 

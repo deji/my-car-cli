@@ -115,8 +115,8 @@ The full login flow (from HAR analysis):
 **Validation:** Syntax check passes, 6/6 unit tests pass. The init script runs before any page JS, so Akamai's bot detection sees a clean fingerprint.
 
 ## Open Questions
-- Token expiry: JWE tokens are opaque — no way to check expiry without hitting the API and getting 401. (Partial: `bias-oidc/v1/validation` discovered in #14 — could check proactively; not yet implemented.)
-- Token refresh: **Answered — see #14.** `POST bias-oidc/v1/jwe/refresh` rotates the JWE. Live-verification + implementation pending (user chose "live-verify first").
+- Token expiry: JWE tokens are opaque — no way to check expiry without hitting the API and getting 401. `GET /cias/v1/validation` exists (see #18) and is not wired. Proactive validation is still open.
+- Token refresh: **Done — see #18.** `POST /cias/v1/jwe/refresh` rotates the JWE. The `bias-oidc` path in #14 was the first guess and returns 404. A 401 from refresh still means a full re-login. The grace window after the status API starts returning 401 is still unmeasured.
 
 ## #13 — Stale UUID in keyring shadowed valid JWE in token file (caused 401 on `status`)
 **Date:** 2026-07-28
@@ -130,17 +130,19 @@ The full login flow (from HAR analysis):
 3. **`login_manual_paste()`** — re-prompts the user if the pasted token doesn't look like a JWE, with guidance to copy the `Authorization` header (not the URL `?token=` param).
 **Validation:** 7 new unit tests in `TestTokenStorage` (keyring fallthrough, env var validation, set/get reject non-JWE, all-invalid → None). All 13 tests pass. End-to-end: `my-car status` now returns live data (200) instead of Session Expired. Verified that the stale UUID was auto-deleted from keyring on the first `get_stored_token()` call after the fix.
 
+**Later:** Credential Manager was removed in #19. The token file is the only store. Do not put keyring back; `CredWrite` cannot hold this JWE.
+
 ---
 
-## #14 — Token refresh endpoint discovered (research; not yet implemented)
+## #14 — Token refresh endpoint discovered (research)
 **Date:** 2026-07-28
-**Status:** Researched. Endpoint shape confirmed from Mercedes' own JS source; live HTTP behavior NOT yet verified. Implementation pending (user chose "live-verify first").
+**Status:** Superseded by #18. The host path in this entry is `bias-oidc/v1`. That path returns 404. Production is `https://api.oneweb.mercedes-benz.com/cias/v1`. Refresh is implemented and a live `POST /cias/v1/jwe/refresh` returned 200.
 
 **Trigger:** This file's Open Questions — "Token refresh: No refresh token flow discovered."
 
 **Finding:** A refresh flow DOES exist. It is not classic OAuth2 `refresh_token` grant — it is a **JWE rotation** model: the (possibly-stale) JWE itself is the refresh credential. The Mercedes web app's auth client (`cias-login.mjs`, a public static asset at `assets.oneweb.mercedes-benz.com/plugin/iam-authentication/latest/chunks/cias-login.mjs`) exposes it. Both local HAR captures include the JS source defining it (no actual refresh HTTP call was captured — see Caveats).
 
-**Endpoints** (base: `https://api.oneweb.mercedes-benz.com/bias-oidc/v1`; `int.` / `test.` prefixes exist for non-prod):
+**Endpoints as first read from the bundle** (this base is wrong for production — see the status line. `int.` / `test.` prefixes exist for non-prod):
 
 | Method | Path | Purpose | Required headers |
 |:---|:---|:---|:---|
@@ -160,24 +162,24 @@ if (!await svc.validate(currentJwe)) {        // GET /validation
 }
 ```
 
-**Why the mobile-app angle matters:** `bias-oidc/v1` is **tenant-scoped** (`tenantId: oneweb`), not app-scoped. Our `status`/`next-service` calls already hit the same `api.oneweb.mercedes-benz.com` host on the same `oneweb` tenant. The Mercedes **me** mobile app (`x-application-name: MMA` on the next-service call) uses the same backend — almost certainly why the user rarely re-logs in: the app silently calls `/jwe/refresh` in the background. The CLI can do the same.
+**Why the mobile-app angle matters:** Refresh is tenant-scoped (`tenantId: oneweb`), not app-scoped. `status` and `next-service` already use that tenant on `api.oneweb.mercedes-benz.com`. The Mercedes **me** app (`x-application-name: MMA` on next-service) uses the same backend and calls `/jwe/refresh` in the background. The CLI does the same on 401. The host path is `/cias/v1`, not `/bias-oidc/v1`.
 
 **Caveats:**
-1. **Not live-verified.** The HARs captured the *JS source* defining the endpoints, but **0 actual `bias-oidc` HTTP requests** were recorded — during both captures the token was still valid, so `validate()` returned true and refresh never fired. Endpoint shape is certain; live response is inferred from `(...).json()).jwe`.
+1. **The HAR did not record a refresh call.** Both captures were taken while the token was still valid, so `validate()` would have returned true and refresh never fired. The 200 from `POST /cias/v1/jwe/refresh` was confirmed later, in #18. The exchange call is still unverified live.
 2. **Refresh window is unknown.** Mercedes calls `validate()` first and refreshes only if it fails — implying refresh works during a grace window *after* the access token stops working on the status API. Duration unknown (hours? weeks?). Only a live test with an expired token will tell.
 3. **No separate refresh_token to store.** The JWE is the credential. If the refresh window has fully expired, the only option is full re-login (current behavior). Refresh is a "silent renew," not a way to recover a long-dead session.
 
-**Proposed implementation** (pending user direction; user chose "live-verify first" as the next step):
-1. **`api.py` — `refresh_token(token)`**: `POST /bias-oidc/v1/jwe/refresh` with `Authorization: Bearer {token}`, `tenantId: oneweb`, `accept: application/json`. On 200, parse `.jwe` from JSON, save via existing `set_stored_token()`, return the new JWE. On 401/4xx, raise `TokenExpiredException` → falls through to the current "re-login required" path.
-2. **`api.py` — `validate_token(token)` (optional helper)**: `GET /bias-oidc/v1/validation` with `Authorization: Bearer {token}`, `ApplicationName: b2xlc`. Returns boolean. Lets us check expiry proactively without burning a status-API call.
+**Proposed implementation** (done, with the base URL corrected in #18; option (a) was chosen, so `status --refresh` still means bypass cache):
+1. **`api.py` — `refresh_token(token)`**: `POST /cias/v1/jwe/refresh` with `Authorization: Bearer {token}`, `tenantId: oneweb`, `accept: application/json`. On 200, parse `.jwe` from JSON, save via `set_stored_token()`, return the new JWE. On 401, raise `TokenExpiredException`. The original draft of this step said `/bias-oidc/v1`; do not use that host.
+2. **`api.py` — `validate_token(token)` (optional helper, still not built)**: `GET /cias/v1/validation` with `Authorization: Bearer {token}`, `ApplicationName: b2xlc`. Returns boolean.
 3. **`main.py` — auto-retry on 401**: in the `status` handler, catch `TokenExpiredException`, call `refresh_token()` once, retry `fetch_vehicle_status()` with the new JWE. Surface "Session Expired" only if refresh also 401s. The existing failure mode stays as the fallback.
 4. **Flag-clash to resolve**: `status --refresh` currently means "bypass cache." If we add a token-refresh concept, either (a) keep refresh fully automatic (no flag — transparent, mirrors the mobile app), or (b) rename cache bypass to `--no-cache` and use `--refresh-token` for an explicit refresh. Recommendation: automatic, no flag.
 5. **Tests**: add unit tests for `refresh_token()` (mock httpx) before wiring into `main.py`, following the existing `TestTokenStorage` pattern in `tests/test_cli.py`.
 
 **Open items:**
-- Live-verify `/jwe/refresh` with the user's currently-stored (still-valid) token. Best case: rotates. Worst case: a 401 we handle. Low risk. Write a small throwaway probe script (httpx POST) — do NOT wire into the CLI until verified.
-- Decide auto-retry vs. explicit `my-car refresh` subcommand vs. both.
-- Measure the refresh grace window once live (call status until 401, then call refresh — does it still work?).
+- Live-verify `/jwe/refresh`: done in #18 against `/cias/v1`, not this entry's base URL. It returned 200.
+- Auto-retry vs. an explicit refresh command: auto-retry only. No new flag.
+- Measure the refresh grace window once live: still open.
 
 ---
 
@@ -200,3 +202,42 @@ if (!await svc.validate(currentJwe)) {        // GET /validation
 **Reason:** Avoid presenting the project as an official or vendor-branded CLI while retaining the required service URLs and a concise MB EQB compatibility note in the README.
 
 **Fix:** Renamed the distribution to `my-car-cli`, Python package to `my_car_cli`, executable to `my-car`, local data directory to `~/.my-car-cli`, keyring service to `my-car-cli`, and token environment variable to `MY_CAR_AUTH_TOKEN`. Updated user-facing text, tests, and documentation. No compatibility aliases were retained because the project has not been publicly released.
+
+---
+
+## #17 — Token refresh + callback UUID exchange wired
+**Date:** 2026-09-30
+**Status:** Superseded by #18. The URLs in this entry were what the first wiring called. They 404. The behavior (one refresh, then one retry; UUID exchanged once) is unchanged.
+
+**Changes:**
+1. **`main.py` — `status` auto-retry**: on `TokenExpiredException` from `fetch_vehicle_status()`, the handler calls `refresh_token()` once, saves the rotated JWE with `set_stored_token()`, and retries `fetch_vehicle_status()` exactly once with the new token. The "Session Expired / re-login" panel appears only if the refresh or the retry also fails. Refresh is fully automatic — no new flag (implements #14 option (a)). The first commit of this called `POST /bias-oidc/v1/jwe/refresh`. The live path is `POST /cias/v1/jwe/refresh` (#18).
+2. **`auth.py` — Playwright wait loop**: each CIAS callback UUID (`?token=<uuid>` on a `mercedes-benz.co.uk` page URL) is exchanged at most once per login session via `extract_intermediate_uuid()` + `exchange_intermediate_token()`. This recovers a JWE when the post-login page's JS never fires an `Authorization: Bearer` request (cf. #9/#10). A failed exchange prints a one-line note and the loop keeps waiting for the header-captured JWE. The first commit called `GET /bias-oidc/v1/jwe/{uuid}`. The live path is `GET /cias/v1/jwe/{uuid}`, and that body is raw text (#18).
+3. **`status --refresh` still means cache bypass only** — it does not force a token refresh; cache bypass and JWE rotation are separate concerns.
+
+**Caveats:** Refresh was live-verified in #18 (HTTP 200). The exchange endpoint has not been called live. The refresh grace window (#14 caveat 2) is still unknown. A 401 from refresh still means a full re-login.
+
+**Tests:** mocked `httpx` tests for `refresh_token()` / `exchange_intermediate_token()` (`tests/test_api.py`); at-most-once callback UUID exchange tests and `CliRunner` tests for the `status` 401 → refresh → retry path, including `--refresh` cache-bypass behavior (`tests/test_cli.py`).
+
+---
+
+## #18 — Refresh 404: live path is `/cias/v1`, not `/bias-oidc/v1`
+**Date:** 2026-09-30
+**Status:** Fixed. Live `POST /cias/v1/jwe/refresh` returned 200.
+
+**Symptom:** `my-car status` printed `Token refresh API error (404)` after the status call returned 401.
+
+**Root cause:** #14 and #17 called `POST https://api.oneweb.mercedes-benz.com/bias-oidc/v1/jwe/refresh`. The auth bundle does contain a `bias-oidc` constant, but the client that actually refreshes (`be()` in the login HAR's `cias-login` script) sets `prefixUrl` from `ue.PROD`, which is `https://api.oneweb.mercedes-benz.com/cias/v1/`. The same capture records live `GET /cias/v1/jwe/{uuid}` and `PUT /cias/v1/claims`. `GET /cias/v1/jwe/{uuid}` returns the JWE as raw text (`response.text()`), not `{"jwe": ...}`. `POST jwe/refresh` still returns JSON `{ "jwe": "..." }`.
+
+**Fix:** `refresh_token` and `exchange_intermediate_token` now use `https://api.oneweb.mercedes-benz.com/cias/v1`. Exchange accepts either a raw JWE body or JSON `{ "jwe": "..." }`. Headers for refresh are unchanged: `Authorization: Bearer`, `tenantId: oneweb`, `Accept: application/json`.
+
+**Follow-up:** A live `POST /cias/v1/jwe/refresh` with the stored JWE returned 200. Saving that JWE through Windows Credential Manager failed (`CredWrite` 1783, blob too large for the ~4800-character token). See #19.
+
+---
+
+## #19 — Drop Windows Credential Manager; store the JWE on disk
+**Date:** 2026-10-01
+**Status:** Fixed.
+
+**Reason:** `CredWrite` returns 1783 for this JWE. The token is about 4800 characters, past what Credential Manager will store, so every save fell through to `~/.my-car-cli/token` anyway.
+
+**Fix:** `get_stored_token`, `set_stored_token`, and `delete_stored_token` use only `~/.my-car-cli/token`. `MY_CAR_AUTH_TOKEN` still overrides that file when the value is a JWE. The `keyring` dependency is removed. The existing `my-car-cli` / `bearer_token` credential is deleted so it cannot shadow the file.

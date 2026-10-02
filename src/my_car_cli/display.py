@@ -3,7 +3,6 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 from my_car_cli.config import load_config
@@ -160,9 +159,16 @@ def render_dashboard(
             else:
                 remaining_m = remaining
                 remaining_km = round(remaining / KM_TO_MILES)
-                
+
+            days_str = ""
+            days_data = next_service_data.get("days")
+            if isinstance(days_data, dict):
+                days_rem = days_data.get("remaining")
+                if isinstance(days_rem, (int, float)) and not isinstance(days_rem, bool):
+                    days_str = f" · {int(round(days_rem)):,} days"
+
             console.print(
-                f"  Due in ~[bold white]{remaining_m:,}[/bold white] miles ({remaining_km:,} km)   "
+                f"  Due in ~[bold white]{remaining_m:,}[/bold white] miles ({remaining_km:,} km){days_str}   "
                 f"Status: [bold green]{ns_status}[/bold green]"
             )
 

@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, Optional, Tuple
 import httpx
 from my_car_cli.config import load_config
@@ -18,6 +19,21 @@ DEFAULT_HEADERS = {
     "Origin": "https://www.mercedes-benz.co.uk",
     "Referer": "https://www.mercedes-benz.co.uk/",
 }
+
+# Auth client base from the site's cias-login bundle (`ue.PROD`).
+# bias-oidc/v1 is an older name in that bundle; live calls use cias/v1.
+CIAS_AUTH_BASE_URL = "https://api.oneweb.mercedes-benz.com/cias/v1"
+REQUEST_TIMEOUT_SECONDS = 10.0
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _looks_like_jwe(token: Any) -> bool:
+    """
+    CIAS-issued JWE tokens are Base64URL, start with 'eyJ', and are long.
+    Local copy of auth._looks_like_jwe — duplicated to avoid an import cycle
+    (auth imports api for these helpers).
+    """
+    return isinstance(token, str) and token.startswith("eyJ") and len(token) > 100
 
 
 def fetch_vehicle_status(token: str, vin: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -79,3 +95,71 @@ def fetch_vehicle_status(token: str, vin: Optional[str] = None) -> Tuple[Dict[st
             next_service_data = {}
 
         return status_data, next_service_data
+
+
+def _jwe_from_body(resp, error_label: str) -> str:
+    """Accept either a raw JWE body or JSON {"jwe": "..."}."""
+    text = resp.text if isinstance(getattr(resp, "text", None), str) else ""
+    cleaned = text.strip().strip('"')
+    if _looks_like_jwe(cleaned):
+        return cleaned
+    try:
+        data = resp.json()
+    except Exception:
+        raise CarAPIError(f"{error_label} ({resp.status_code}): response was not JSON.")
+    jwe = data.get("jwe") if isinstance(data, dict) else None
+    if not _looks_like_jwe(jwe):
+        raise CarAPIError(f"{error_label} ({resp.status_code}): response did not contain a valid JWE.")
+    return jwe
+
+
+def refresh_token(token: str) -> str:
+    """
+    Rotate the CIAS JWE via POST /cias/v1/jwe/refresh using the current
+    (possibly stale) JWE as the credential. Returns the new JWE string.
+    Does not save the token.
+    """
+    url = f"{CIAS_AUTH_BASE_URL}/jwe/refresh"
+    headers = {
+        **DEFAULT_HEADERS,
+        "Authorization": f"Bearer {token}",
+        "tenantId": "oneweb",
+        "Accept": "application/json",
+    }
+
+    with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        resp = client.post(url, headers=headers)
+
+    if resp.status_code == 401:
+        raise TokenExpiredException("Authentication token has expired.")
+    if resp.status_code != 200:
+        raise CarAPIError(f"Token refresh API error ({resp.status_code}).")
+
+    return _jwe_from_body(resp, "Token refresh API error")
+
+
+def exchange_intermediate_token(intermediate: str) -> str:
+    """
+    Exchange a CIAS callback intermediate token (canonical UUID) for a real
+    JWE bearer via GET /cias/v1/jwe/{uuid}. The site reads this body as text.
+    Returns the JWE string. Does not save the token.
+    """
+    if not isinstance(intermediate, str) or not _UUID_RE.match(intermediate):
+        raise CarAPIError("Token exchange rejected: intermediate token is not a canonical UUID.")
+
+    url = f"{CIAS_AUTH_BASE_URL}/jwe/{intermediate}"
+    headers = {
+        **DEFAULT_HEADERS,
+        "Accept": "application/json",
+        "tenantId": "oneweb",
+    }
+
+    with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        resp = client.get(url, headers=headers)
+
+    if resp.status_code == 401:
+        raise TokenExpiredException("Authentication token has expired.")
+    if resp.status_code != 200:
+        raise CarAPIError(f"Token exchange API error ({resp.status_code}).")
+
+    return _jwe_from_body(resp, "Token exchange API error")

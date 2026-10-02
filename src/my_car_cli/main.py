@@ -13,7 +13,7 @@ if sys.platform == "win32":
         pass
 
 from my_car_cli import __version__
-from my_car_cli.api import CarAPIError, TokenExpiredException, fetch_vehicle_status
+from my_car_cli.api import CarAPIError, TokenExpiredException, fetch_vehicle_status, refresh_token
 from my_car_cli.auth import (
     BROWSER_PROFILE_DIR,
     delete_stored_token,
@@ -24,7 +24,7 @@ from my_car_cli.auth import (
     set_stored_token,
 )
 from my_car_cli.cache import clear_cache, get_cache_timestamp, get_cached_data, save_cached_data
-from my_car_cli.config import load_config, update_config_key
+from my_car_cli.config import load_config, update_config_key, validate_pressure_unit, validate_ttl
 from my_car_cli.display import render_dashboard
 
 app = typer.Typer(
@@ -110,7 +110,18 @@ def status(
     # 2. Fetch live data
     with console.status("[bold cyan]Fetching vehicle status...[/bold cyan]"):
         try:
-            status_data, next_service_data = fetch_vehicle_status(token, active_vin)
+            try:
+                status_data, next_service_data = fetch_vehicle_status(token, active_vin)
+            except TokenExpiredException:
+                # The JWE can be rotated silently while the refresh window is
+                # still open (#14/#17): refresh once, save the rotated token,
+                # retry the fetch once. If refresh fails or the save is
+                # rejected, re-raise into the "please re-login" path below.
+                refreshed_token = refresh_token(token)
+                if not set_stored_token(refreshed_token):
+                    raise
+                console.print("[green]✔ Session renewed — retrying...[/green]")
+                status_data, next_service_data = fetch_vehicle_status(refreshed_token, active_vin)
         except TokenExpiredException:
             panel = Panel(
                 "[bold red]Your authentication session has expired.[/bold red]\n\n"
@@ -153,18 +164,37 @@ def logout():
 def config_cmd(
     vin: Optional[str] = typer.Option(None, "--vin", help="Set vehicle VIN."),
     unit: Optional[str] = typer.Option(None, "--unit", help="Set tyre pressure unit (PSI, KPA)."),
+    ttl: Optional[int] = typer.Option(None, "--ttl", help="Set cache TTL in minutes."),
     show: bool = typer.Option(False, "--show", help="Display current configuration."),
 ):
     """View or update configuration settings."""
+    validated_unit = None
+    if unit is not None:
+        try:
+            validated_unit = validate_pressure_unit(unit)
+        except ValueError as e:
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1)
+
+    if ttl is not None:
+        try:
+            validate_ttl(ttl)
+        except ValueError as e:
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1)
+
     cfg = load_config()
     if vin:
         cfg = update_config_key("vin", vin)
         console.print(f"[bold green]✔ VIN set to:[/bold green] {vin}")
-    if unit:
-        cfg = update_config_key("pressure_unit", unit.upper())
-        console.print(f"[bold green]✔ Tyre pressure unit set to:[/bold green] {unit.upper()}")
-    
-    if show or (not vin and not unit):
+    if validated_unit is not None:
+        cfg = update_config_key("pressure_unit", validated_unit)
+        console.print(f"[bold green]✔ Tyre pressure unit set to:[/bold green] {validated_unit}")
+    if ttl is not None:
+        cfg = update_config_key("cache_ttl_minutes", ttl)
+        console.print(f"[bold green]✔ Cache TTL set to:[/bold green] {ttl} minutes")
+
+    if show or (not vin and not unit and ttl is None):
         console.print("\n[bold cyan]⚙️ My Car CLI Configuration[/bold cyan]")
         console.print(f"  [bold white]VIN:[/bold white] {cfg.get('vin')}")
         console.print(f"  [bold white]Locale:[/bold white] {cfg.get('locale')}")
